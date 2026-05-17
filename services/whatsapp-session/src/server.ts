@@ -465,7 +465,7 @@ markOnlineOnConnect: true,
     let pairingCode: string | undefined;
     if (pairingPhone && !sock.authState.creds.registered) {
       // Baileys requires the socket to be open enough to negotiate; small delay is recommended.
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 5000));
       try {
         pairingCode = await sock.requestPairingCode(pairingPhone);
         entry.pairingCode = pairingCode;
