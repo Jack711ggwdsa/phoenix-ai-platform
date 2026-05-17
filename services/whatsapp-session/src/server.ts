@@ -332,5 +332,3 @@ async function handleIncomingMessage(
               : "");
 
   log.info({ phone, fromMe, type: content.type }, "[baileys] new message");
-}
-}
