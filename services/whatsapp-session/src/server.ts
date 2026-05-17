@@ -34,6 +34,7 @@ import { Boom } from "@hapi/boom";
 const log = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
 const PORT = Number(process.env.PORT ?? 8787);
+const RUNTIME_VERSION = "qr-runtime-fix-v2";
 const SHARED_TOKEN = process.env.SESSION_SERVICE_TOKEN ?? "";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -355,6 +356,14 @@ io.on("connection", (socket) => {
       socket.emit("session-connected", { device_slot: slot });
     }
   }
+});
+app.get("/debug", (_req, res) => {
+  res.json({
+    ok: true,
+    version: RUNTIME_VERSION,
+    timestamp: new Date().toISOString(),
+    sessions: sessions.size,
+  });
 });
 
 server.listen(PORT, () => {
