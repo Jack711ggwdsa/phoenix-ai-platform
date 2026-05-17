@@ -443,15 +443,21 @@ async function startWhatsAppSession(
     const { version, isLatest } = await fetchLatestBaileysVersion();
     logger.info({ version, isLatest }, "Fetched Baileys version");
 
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: false,
-browser: ["WhatsApp", "Chrome", "122.0.0.0"],
-syncFullHistory: true,
-markOnlineOnConnect: true,
-      logger,
-    });
+const sock = makeWASocket({
+  version,
+  auth: state,
+
+  printQRInTerminal: false,
+
+  mobile: false,
+
+  browser: ["Ubuntu", "Chrome", "20.0.04"],
+
+  syncFullHistory: true,
+  markOnlineOnConnect: true,
+
+  logger,
+});
 
     const entry: SessionEntry = {
       sock,
