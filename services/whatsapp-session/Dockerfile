@@ -8,5 +8,4 @@ COPY src ./src
 RUN npx tsc -p tsconfig.json
 ENV NODE_ENV=production
 EXPOSE 8787
-VOLUME ["/app/sessions"]
 CMD ["node", "--enable-source-maps", "dist/server.js"]
