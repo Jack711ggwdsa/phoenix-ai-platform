@@ -176,6 +176,7 @@ async function loadAuthStateWithRetry(authDir: string) {
 
 function jidToPhone(jid: string | null | undefined): string | null {
   if (!jid) return null;
+  // e.g. "60123456789:7@s.whatsapp.net" or "60123456789@s.whatsapp.net"
   const bare = jid.split("@")[0];
   const phone = bare.split(":")[0];
   return phone || null;
@@ -193,6 +194,7 @@ function extractMessageContent(
   message: Record<string, any> | null | undefined,
 ): { type: string; text: string | null; mediaUrl: string | null } | null {
   if (!message) return null;
+  // Skip protocol / reaction / receipt frames
   if (message.protocolMessage || message.reactionMessage || message.senderKeyDistributionMessage) {
     return null;
   }
@@ -252,7 +254,7 @@ async function upsertContact(
   }
 
   if (existing) {
-    const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
+        const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (patch.display_name && !existing.display_name) update.display_name = patch.display_name;
     if (patch.avatar_url && !existing.avatar_url) update.avatar_url = patch.avatar_url;
     if (patch.last_message_preview !== undefined)
@@ -305,6 +307,7 @@ async function handleIncomingMessage(
 
   const content = extractMessageContent(m.message);
   if (!content) return;
+  // ignore empty text-only with no body
   if (content.type === "text" && !content.text) return;
 
   const fromMe = Boolean(m.key?.fromMe);
@@ -332,3 +335,560 @@ async function handleIncomingMessage(
               : "");
 
   log.info({ phone, fromMe, type: content.type }, "[baileys] new message");
+
+  // Upsert contact first so we have contact_id
+  const contactId = await upsertContact(
+    clientId,
+    slot,
+    phone,
+    {
+      display_name: !fromMe ? senderName : null,
+      last_message_preview: preview,
+      last_message_at: sentAt,
+      incrementUnread: !fromMe,
+    },
+    logger,
+  );
+
+  // Save message
+  if (supabase) {
+        const { error } = await supabase.from("whatsapp_messages").insert({
+      client_id: clientId,
+      device_slot: slot,
+      contact_id: contactId,
+      direction: fromMe ? "outbound" : "inbound",
+      body: content.text,
+      message_type: content.type,
+      is_ai_reply: false,
+      sent_at: sentAt,
+    });
+    if (error) {
+      logger.error({ error: error.message }, "message insert failed");
+    } else {
+      log.info({ phone, type: content.type }, "[supabase] message saved");
+    }
+  }
+
+  // Emit realtime events for the inbox
+  io.to(room(clientId, "whatsapp")).emit("messages-upsert", {
+    device_slot: slot,
+    phone,
+    from_me: fromMe,
+    message_type: content.type,
+    body: content.text,
+    sent_at: sentAt,
+  });
+  io.to(room(clientId, "whatsapp")).emit("contacts-upsert", {
+    device_slot: slot,
+    phone,
+    display_name: senderName,
+    last_message_preview: preview,
+    last_message_at: sentAt,
+  });
+}
+
+async function handleContactUpsert(
+  clientId: string,
+  slot: number,
+  c: any,
+  logger: pino.Logger,
+) {
+  const jid: string | undefined = c?.id;
+  if (isIgnorableJid(jid)) return;
+  const phone = jidToPhone(jid);
+  if (!phone) return;
+  const name: string | null = c?.notify ?? c?.name ?? c?.verifiedName ?? null;
+  const avatar: string | null = c?.imgUrl ?? null;
+  log.info({ phone, name }, "[baileys] contact updated");
+  await upsertContact(
+    clientId,
+    slot,
+    phone,
+    { display_name: name, avatar_url: avatar },
+    logger,
+  );
+  io.to(room(clientId, "whatsapp")).emit("contacts-upsert", {
+    device_slot: slot,
+    phone,
+    display_name: name,
+    avatar_url: avatar,
+  });
+}
+
+async function startWhatsAppSession(
+  clientId: string,
+  slot: number,
+  reconnectAttempt = 0,
+  pairingPhone?: string,
+): Promise<{ pairingCode?: string }> {
+  const k = key(clientId, "whatsapp", slot);
+  const existing = sessions.get(k);
+  if (existing?.status === "connected") return {}; // already live
+  if (!pairingPhone && (existing?.status === "pending" || existing?.status === "connecting") && existing.qr && existing.qrExpiresAt) {
+    emitQrUpdate(clientId, slot, existing.qr, existing.qrExpiresAt);
+    return {};
+  }
+  // If a session already exists and we're requesting a pairing code, tear it down so we can re-init.
+  if (pairingPhone && existing) {
+    try { existing.sock.end(undefined as never); } catch { /* ignore */ }
+    sessions.delete(k);
+  }
+
+  const authDir = path.join(SESSIONS_ROOT, clientId, "whatsapp", `device-${slot}`);
+  const logger = log.child({ slot, clientId, authDir, area: "baileys" });
+
+  try {
+    logger.info({ reconnectAttempt }, "Starting WhatsApp session");
+    const { state, saveCreds } = await loadAuthStateWithRetry(authDir);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info({ version, isLatest }, "Fetched Baileys version");
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      browser: ["Phoenix CRM", "Chrome", "1.0.0"],
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+      logger,
+    });
+
+    const entry: SessionEntry = {
+      sock,
+      status: "connecting",
+      reconnectAttempts: reconnectAttempt,
+      authDir,
+    };
+    sessions.set(k, entry);
+
+    // Phone-pairing-code flow: request a pairing code instead of waiting on a QR.
+    let pairingCode: string | undefined;
+    if (pairingPhone && !sock.authState.creds.registered) {
+      // Baileys requires the socket to be open enough to negotiate; small delay is recommended.
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        pairingCode = await sock.requestPairingCode(pairingPhone);
+        entry.pairingCode = pairingCode;
+        entry.pairingPhone = pairingPhone;
+        entry.status = "pending";
+        logger.info({ pairingPhone, pairingCode }, "Generated WhatsApp pairing code");
+        io.to(room(clientId, "whatsapp")).emit("pairing-code", {
+          device_slot: slot,
+          pairing_code: pairingCode,
+          phone_number: pairingPhone,
+        });
+        await mirrorToSupabase(clientId, "whatsapp", slot, {
+          connection_status: "pending",
+          session_health: "pairing_code_ready",
+        });
+      } catch (err) {
+        const message = summarizeError(err);
+        logger.error({ error: message }, "requestPairingCode failed");
+        entry.lastError = message;
+        throw err;
+      }
+    }
+
+    sock.ev.on("creds.update", () => {
+      void saveCreds().catch((err) => {
+        logger.error({ error: summarizeError(err) }, "Failed to persist Baileys credentials");
+      });
+    });
+
+    // ---------- Messages & contacts sync (Baileys -> Supabase + Socket.IO) ----------
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify" && type !== "append") return;
+      for (const m of messages) {
+        try {
+          await handleIncomingMessage(clientId, slot, m, logger);
+        } catch (err) {
+          logger.error({ error: summarizeError(err) }, "Failed to handle incoming message");
+        }
+      }
+    });
+
+    sock.ev.on("contacts.upsert", async (contacts) => {
+      for (const c of contacts) {
+        try {
+          await handleContactUpsert(clientId, slot, c, logger);
+        } catch (err) {
+          logger.error({ error: summarizeError(err) }, "Failed to handle contact upsert");
+        }
+      }
+    });
+
+    sock.ev.on("contacts.update", async (updates) => {
+      for (const c of updates) {
+        try {
+          await handleContactUpsert(clientId, slot, c, logger);
+        } catch (err) {
+          logger.error({ error: summarizeError(err) }, "Failed to handle contact update");
+        }
+      }
+    });
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      const disconnectError = lastDisconnect?.error;
+      const disconnectMessage = disconnectError ? summarizeError(disconnectError) : undefined;
+      const statusCode = (disconnectError as Boom | undefined)?.output?.statusCode;
+
+      logger.info(
+        {
+          connection,
+          hasQr: Boolean(qr),
+          statusCode,
+          disconnectMessage,
+        },
+        "Baileys connection.update",
+      );
+
+      if (connection === "connecting") {
+        entry.status = "connecting";
+      }
+
+      if (qr) {
+        const generatedAt = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + 20_000).toISOString();
+        entry.qr = qr;
+        entry.qrExpiresAt = expiresAt;
+        entry.latestQrTimestamp = generatedAt;
+        entry.status = "pending";
+        entry.lastError = undefined;
+        logger.info({ generatedAt, expiresAt }, "Generated WhatsApp QR code");
+        emitQrUpdate(clientId, slot, qr, expiresAt);
+        await mirrorToSupabase(clientId, "whatsapp", slot, {
+          connection_status: "pending",
+          qr_code: qr,
+          qr_expires_at: expiresAt,
+          session_health: "qr_ready",
+        });
+      }
+
+      if (connection === "open") {
+        entry.status = "connected";
+        entry.qr = undefined;
+        entry.qrExpiresAt = undefined;
+        entry.lastError = undefined;
+        entry.reconnectAttempts = 0;
+        const me = sock.user;
+        const deviceName = me?.name ?? me?.id ?? null;
+        entry.deviceName = deviceName;
+        logger.info({ deviceName }, "WhatsApp session connected");
+        io.to(room(clientId, "whatsapp")).emit("session-connected", {
+          device_slot: slot,
+          device_name: deviceName,
+        });
+        await mirrorToSupabase(clientId, "whatsapp", slot, {
+          connection_status: "connected",
+          qr_code: null,
+          qr_expires_at: null,
+          last_connected_at: new Date().toISOString(),
+          device_name: deviceName,
+          session_health: "ok",
+        });
+      }
+
+      if (connection === "close") {
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        const reason = disconnectMessage ?? `Baileys closed with status ${statusCode ?? "unknown"}`;
+
+        logger.error({ statusCode, reason, loggedOut }, "Baileys connection closed");
+
+        if (loggedOut) {
+          entry.status = "session_expired";
+          entry.lastError = reason;
+          io.to(room(clientId, "whatsapp")).emit("session-expired", { device_slot: slot });
+          await mirrorToSupabase(clientId, "whatsapp", slot, {
+            connection_status: "session_expired",
+            qr_code: null,
+            qr_expires_at: null,
+            session_health: "session_expired",
+          });
+          sessions.delete(k);
+          await fs.rm(authDir, { recursive: true, force: true });
+          return;
+        }
+
+        entry.status = "disconnected";
+        entry.lastError = reason;
+        entry.reconnectAttempts += 1;
+        const attempt = entry.reconnectAttempts;
+        const delayMs = Math.min(1_000 * attempt, 5_000);
+        io.to(room(clientId, "whatsapp")).emit("session-disconnected", { device_slot: slot });
+        io.to(room(clientId, "whatsapp")).emit("reconnecting", {
+          device_slot: slot,
+          attempt,
+        });
+        await mirrorToSupabase(clientId, "whatsapp", slot, {
+          connection_status: "disconnected",
+          session_health: reason.slice(0, 240),
+        });
+        setTimeout(() => {
+          void startWhatsAppSession(clientId, slot, attempt).catch((err) => {
+            logger.error({ error: summarizeError(err), attempt }, "Reconnect failed");
+          });
+        }, delayMs);
+      }
+    });
+    return { pairingCode };
+  } catch (err) {
+    const message = summarizeError(err);
+    log.error({ clientId, slot, authDir, error: message }, "Failed to start WhatsApp session");
+    emitConnectionError(clientId, slot, message);
+    await mirrorToSupabase(clientId, "whatsapp", slot, {
+      connection_status: "disconnected",
+      qr_code: null,
+      qr_expires_at: null,
+      session_health: message.slice(0, 240),
+    });
+    sessions.delete(k);
+    throw err;
+  }
+}
+
+async function stopWhatsAppSession(clientId: string, slot: number): Promise<void> {
+  const k = key(clientId, "whatsapp", slot);
+  const entry = sessions.get(k);
+  if (entry) {
+    try {
+      await entry.sock.logout();
+    } catch {
+      // ignore
+    }
+    sessions.delete(k);
+  }
+  const authDir = path.join(SESSIONS_ROOT, clientId, "whatsapp", `device-${slot}`);
+  await fs.rm(authDir, { recursive: true, force: true });
+  io.to(room(clientId, "whatsapp")).emit("session-disconnected", { device_slot: slot });
+  await mirrorToSupabase(clientId, "whatsapp", slot, {
+    connection_status: "empty",
+    qr_code: null,
+    qr_expires_at: null,
+    device_name: null,
+    last_connected_at: null,
+    session_health: null,
+  });
+}
+
+/* ------------------------------- HTTP API -------------------------------- */
+
+function checkAuth(req: express.Request, res: express.Response): boolean {
+  if (!SHARED_TOKEN) return true;
+  const header = req.headers.authorization;
+  if (header === `Bearer ${SHARED_TOKEN}`) return true;
+  res.status(401).json({ ok: false, error: "Unauthorized" });
+  return false;
+}
+
+const startSchema = z.object({
+  client_id: z.string().uuid(),
+  platform: z.literal("whatsapp"),
+  device_slot: z.number().int().min(1).max(5),
+});
+
+const routeParamsSchema = z.object({
+  platform: z.literal("whatsapp"),
+  deviceSlot: z.string().regex(/^device-[1-5]$/),
+});
+
+function getSocketConnectedCount(): number {
+  return io.of("/").sockets.size;
+}
+
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, sessions: sessions.size, uptime: process.uptime(), port: PORT, host: HOST }),
+);
+
+// Runtime diagnostics endpoint — v2 (force resync to GitHub)
+app.get("/debug", (_req, res) => {
+  res.json({
+    ok: true,
+    version: "messages-sync-v1",
+    timestamp: new Date().toISOString(),
+    socket_connected_count: getSocketConnectedCount(),
+    active_sessions: sessions.size,
+    latest_qr_timestamp: getLatestQrTimestamp(),
+    baileys_connection_state: getBaileysConnectionState(),
+    sessions: [...sessions.entries()].map(([sessionKey, entry]) => ({
+      session_key: sessionKey,
+      status: entry.status,
+      qr_expires_at: entry.qrExpiresAt ?? null,
+      latest_qr_timestamp: entry.latestQrTimestamp ?? null,
+      device_name: entry.deviceName ?? null,
+      reconnect_attempts: entry.reconnectAttempts,
+      last_error: entry.lastError ?? null,
+      auth_dir: entry.authDir,
+    })),
+  });
+});
+
+app.post("/api/start-session", async (req, res) => {
+    if (!checkAuth(req, res)) return;
+  const parsed = startSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ ok: false, error: parsed.error.flatten() });
+    return;
+  }
+  const { client_id, device_slot } = parsed.data;
+  try {
+    await startWhatsAppSession(client_id, device_slot);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ err }, "start-session failed");
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+const pairingSchema = z.object({
+  client_id: z.string().uuid(),
+  device_slot: z.number().int().min(1).max(5),
+  phone_number: z
+    .string()
+    .min(6)
+    .max(20)
+    .transform((v) => v.replace(/[^0-9]/g, "")),
+});
+
+app.post("/api/request-pairing-code", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const parsed = pairingSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ ok: false, error: parsed.error.flatten() });
+    return;
+  }
+  const { client_id, device_slot, phone_number } = parsed.data;
+  if (!phone_number || phone_number.length < 6) {
+    res.status(400).json({ ok: false, error: "Invalid phone_number" });
+    return;
+  }
+  try {
+    const result = await startWhatsAppSession(client_id, device_slot, 0, phone_number);
+    if (!result.pairingCode) {
+      res.status(500).json({ ok: false, error: "Pairing code was not generated" });
+      return;
+    }
+    res.json({
+      ok: true,
+      pairing_code: result.pairingCode,
+      phone_number,
+    });
+  } catch (err) {
+    log.error({ err }, "request-pairing-code failed");
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+app.post("/api/start-session/:platform/:deviceSlot", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const routeParsed = routeParamsSchema.safeParse(req.params);
+  const bodyParsed = z.object({ client_id: z.string().uuid() }).safeParse(req.body);
+  if (!routeParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      ok: false,
+      error: {
+        params: routeParsed.success ? null : routeParsed.error.flatten(),
+        body: bodyParsed.success ? null : bodyParsed.error.flatten(),
+      },
+    });
+    return;
+  }
+
+  const slot = Number(routeParsed.data.deviceSlot.replace("device-", ""));
+  try {
+    await startWhatsAppSession(bodyParsed.data.client_id, slot);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ err }, "start-session route failed");
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+app.post("/api/stop-session", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const parsed = startSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ ok: false, error: parsed.error.flatten() });
+    return;
+  }
+  const { client_id, device_slot } = parsed.data;
+  try {
+    await stopWhatsAppSession(client_id, device_slot);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ err }, "stop-session failed");
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+app.post("/api/stop-session/:platform/:deviceSlot", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const routeParsed = routeParamsSchema.safeParse(req.params);
+  const bodyParsed = z.object({ client_id: z.string().uuid() }).safeParse(req.body);
+  if (!routeParsed.success || !bodyParsed.success) {
+    res.status(400).json({
+      ok: false,
+      error: {
+        params: routeParsed.success ? null : routeParsed.error.flatten(),
+        body: bodyParsed.success ? null : bodyParsed.error.flatten(),
+      },
+    });
+    return;
+  }
+
+  const slot = Number(routeParsed.data.deviceSlot.replace("device-", ""));
+  try {
+    await stopWhatsAppSession(bodyParsed.data.client_id, slot);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error({ err }, "stop-session route failed");
+    res.status(500).json({ ok: false, error: (err as Error).message });
+  }
+});
+
+/* ------------------------------ Socket.IO -------------------------------- */
+
+io.on("connection", (socket) => {
+  const clientId = String(socket.handshake.query.clientId ?? "");
+  const platform = String(socket.handshake.query.platform ?? "whatsapp") as Platform;
+  if (!clientId) {
+    socket.disconnect(true);
+    return;
+  }
+  log.info({ socketId: socket.id, clientId, platform, socketCount: getSocketConnectedCount() }, "Socket.IO client connected");
+  socket.join(room(clientId, platform));
+
+  // Replay current state for each known slot
+  for (const [k, entry] of sessions) {
+    const [cid, plat, slotStr] = k.split(":");
+    if (cid !== clientId || plat !== platform) continue;
+    const slot = Number(slotStr);
+    if (entry.qr && entry.status === "pending") {
+      socket.emit("qr-update", {
+        device_slot: slot,
+        qr_code: entry.qr,
+        qr_expires_at: entry.qrExpiresAt,
+      });
+    } else if (entry.status === "connected") {
+      socket.emit("session-connected", { device_slot: slot });
+    } else if (entry.lastError) {
+      socket.emit("connection-error", { device_slot: slot, message: entry.lastError });
+    }
+  }
+
+  socket.on("disconnect", (reason) => {
+    log.info({ socketId: socket.id, clientId, platform, reason, socketCount: getSocketConnectedCount() }, "Socket.IO client disconnected");
+  });
+});
+
+process.on("unhandledRejection", (error) => {
+  log.error({ error: summarizeError(error) }, "Unhandled promise rejection in session service");
+});
+
+process.on("uncaughtException", (error) => {
+  log.fatal({ error: summarizeError(error) }, "Uncaught exception in session service");
+});
+
+server.listen(PORT, HOST, () => {
+  log.info({ host: HOST, port: PORT }, "Phoenix WhatsApp session service listening");
+});
