@@ -204,7 +204,7 @@ async function startWhatsAppSession(
       version,
       auth: state,
       printQRInTerminal: false,
-      browser: ["Phoenix CRM", "Chrome", "1.0.0"],
+      browser: ["Ubuntu", "Chrome", "22.04.4"],
       syncFullHistory: false,
       markOnlineOnConnect: false,
       logger,
@@ -222,7 +222,7 @@ async function startWhatsAppSession(
     let pairingCode: string | undefined;
     if (pairingPhone && !sock.authState.creds.registered) {
       // Baileys requires the socket to be open enough to negotiate; small delay is recommended.
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 5000));
       try {
         pairingCode = await sock.requestPairingCode(pairingPhone);
         entry.pairingCode = pairingCode;
