@@ -447,9 +447,9 @@ async function startWhatsAppSession(
       version,
       auth: state,
       printQRInTerminal: false,
-      browser: ["Phoenix CRM", "Chrome", "1.0.0"],
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
+browser: ["WhatsApp", "Chrome", "122.0.0.0"],
+syncFullHistory: true,
+markOnlineOnConnect: true,
       logger,
     });
 
