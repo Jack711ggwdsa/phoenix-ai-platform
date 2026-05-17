@@ -116,12 +116,17 @@ async function startWhatsAppSession(clientId: string, slot: number): Promise<voi
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    logger: log.child({ slot, clientId }),
-  });
+const sock = makeWASocket({
+  version,
+  auth: state,
+  printQRInTerminal: true,
+  browser: ["Ubuntu", "Chrome", "22.04.4"],
+  syncFullHistory: false,
+  markOnlineOnConnect: false,
+  generateHighQualityLinkPreview: false,
+  qrTimeout: 60000,
+  logger: log.child({ slot, clientId }),
+});
 
   const entry: SessionEntry = { sock, status: "pending" };
   sessions.set(k, entry);
