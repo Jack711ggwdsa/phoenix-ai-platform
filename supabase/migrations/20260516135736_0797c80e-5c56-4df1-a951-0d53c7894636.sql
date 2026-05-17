@@ -1,0 +1,1 @@
+ALTER TABLE public.device_connections ADD COLUMN IF NOT EXISTS provider text;
